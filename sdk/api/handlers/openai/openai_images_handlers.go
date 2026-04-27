@@ -537,7 +537,6 @@ func (h *OpenAIAPIHandler) collectImagesFromResponses(c *gin.Context, responsesR
 	c.Header("Content-Type", "application/json")
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
 
 	mainModel := strings.TrimSpace(gjson.GetBytes(responsesReq, "model").String())
@@ -731,7 +730,6 @@ func (h *OpenAIAPIHandler) streamImagesFromResponses(c *gin.Context, responsesRe
 	}
 
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	cliCtx = handlers.WithDisallowFreeAuth(cliCtx)
 	mainModel := strings.TrimSpace(gjson.GetBytes(responsesReq, "model").String())
 	if mainModel == "" {
 		mainModel = defaultImagesMainModel

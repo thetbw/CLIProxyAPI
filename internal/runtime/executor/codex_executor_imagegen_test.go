@@ -101,7 +101,7 @@ func TestEnsureImageGenerationTool_GPT53CodexSparkDoesNotInjectTool(t *testing.T
 	}
 }
 
-func TestEnsureImageGenerationTool_FreeCodexAuthDoesNotInjectTool(t *testing.T) {
+func TestEnsureImageGenerationTool_FreeCodexAuthInjectsTool(t *testing.T) {
 	body := []byte(`{"model":"gpt-5.4","input":"draw a cat"}`)
 	freeAuth := &cliproxyauth.Auth{
 		Provider:   "codex",
@@ -109,10 +109,15 @@ func TestEnsureImageGenerationTool_FreeCodexAuthDoesNotInjectTool(t *testing.T) 
 	}
 	result := ensureImageGenerationTool(body, "gpt-5.4", freeAuth)
 
-	if string(result) != string(body) {
-		t.Fatalf("expected body to be unchanged, got %s", string(result))
+	tools := gjson.GetBytes(result, "tools")
+	if !tools.IsArray() {
+		t.Fatalf("expected tools array, got %v", tools.Type)
 	}
-	if gjson.GetBytes(result, "tools").Exists() {
-		t.Fatalf("expected no tools for free codex auth, got %s", gjson.GetBytes(result, "tools").Raw)
+	arr := tools.Array()
+	if len(arr) != 1 {
+		t.Fatalf("expected 1 tool, got %d", len(arr))
+	}
+	if arr[0].Get("type").String() != "image_generation" {
+		t.Fatalf("expected type=image_generation, got %s", arr[0].Get("type").String())
 	}
 }

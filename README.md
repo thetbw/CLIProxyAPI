@@ -54,6 +54,7 @@ VisionCoder is also offering our users a limited-time <a href="https://coder.vis
 ## Overview
 
 - OpenAI/Gemini/Claude compatible API endpoints for CLI models
+- OpenAI-compatible image generation/editing endpoints (`/v1/images/generations`, `/v1/images/edits`) backed by Codex built-in `image_generation` tool (`gpt-image-2`) without requiring OpenAI API keys
 - OpenAI Codex support (GPT models) via OAuth login
 - Claude Code support via OAuth login
 - Amp CLI and IDE extensions support with provider routing
