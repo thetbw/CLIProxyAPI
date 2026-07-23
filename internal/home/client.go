@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -18,32 +19,40 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginstore"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	redisKeyConfig     = "config"
-	redisChannelConfig = "config"
-	redisKeyModels     = "models"
-	redisKeyUsage      = "usage"
-	redisKeyRequestLog = "request-log"
-	redisKeyAppLog     = "app-log"
+	redisKeyConfig       = "config"
+	redisChannelConfig   = "config"
+	redisKeyUsage        = "usage"
+	redisKeyRequestLog   = "request-log"
+	redisKeyAppLog       = "app-log"
+	redisKeyPluginStatus = "plugin-status"
+	redisKeyPluginTasks  = "plugin-tasks"
+	redisKeyPluginSync   = "plugin-sync"
 
 	homeReconnectInterval          = time.Second
 	homeReconnectFailoverThreshold = 3
 	homeRedisOperationTimeout      = 3 * time.Second
+	homePluginSyncOperationTimeout = 2 * time.Minute
 	homeSubscriptionReceiveTimeout = 3 * time.Second
 	redisChannelCluster            = "cluster"
 )
 
+const pluginSyncUnsupportedErrorType = "plugin_sync_unsupported"
+
 var (
-	ErrDisabled       = errors.New("home client disabled")
-	ErrNotConnected   = errors.New("home not connected")
-	ErrEmptyResponse  = errors.New("home returned empty response")
-	ErrAuthNotFound   = errors.New("home auth not found")
-	ErrConfigNotFound = errors.New("home config not found")
-	ErrModelsNotFound = errors.New("home models not found")
+	ErrDisabled              = errors.New("home client disabled")
+	ErrNotConnected          = errors.New("home not connected")
+	ErrEmptyResponse         = errors.New("home returned empty response")
+	ErrAuthNotFound          = errors.New("home auth not found")
+	ErrConfigNotFound        = errors.New("home config not found")
+	ErrModelsNotFound        = errors.New("home models not found")
+	ErrPluginSyncUnsupported = errors.New("home plugin sync is unsupported")
 )
 
 type clusterNode struct {
@@ -59,6 +68,23 @@ type clusterNodesEnvelope struct {
 	Nodes []clusterNode `json:"nodes"`
 }
 
+type PluginTask struct {
+	ID             uint      `json:"id"`
+	Operation      string    `json:"operation"`
+	PluginID       string    `json:"plugin_id"`
+	TargetNodeType string    `json:"target_node_type,omitempty"`
+	TargetNodeID   string    `json:"target_node_id,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type KVSetOptions struct {
+	EX time.Duration
+	PX time.Duration
+	NX bool
+	XX bool
+}
+
 type Client struct {
 	mu sync.Mutex
 
@@ -66,8 +92,9 @@ type Client struct {
 	seedHost string
 	seedPort int
 
-	cmd *redis.Client
-	sub *redis.Client
+	cmd        *redis.Client
+	cmdOptions *redis.Options
+	sub        *redis.Client
 
 	heartbeatOK       atomic.Bool
 	clusterNodes      []clusterNode
@@ -119,6 +146,7 @@ func (c *Client) closeClientsLocked() {
 		_ = c.sub.Close()
 	}
 	c.cmd = nil
+	c.cmdOptions = nil
 	c.sub = nil
 }
 
@@ -162,6 +190,7 @@ func (c *Client) ensureClients() error {
 		if errOptions != nil {
 			return errOptions
 		}
+		c.cmdOptions = cloneRedisOptions(options)
 		c.cmd = redis.NewClient(options)
 	}
 	if c.sub == nil {
@@ -189,6 +218,21 @@ func (c *Client) redisOptionsLocked(addr string) (*redis.Options, error) {
 		DialerRetries:         1,
 		ContextTimeoutEnabled: true,
 	}, nil
+}
+
+func cloneRedisOptions(options *redis.Options) *redis.Options {
+	if options == nil {
+		return nil
+	}
+	cloned := *options
+	if options.TLSConfig != nil {
+		cloned.TLSConfig = options.TLSConfig.Clone()
+	}
+	if options.MaintNotificationsConfig != nil {
+		maintNotifications := *options.MaintNotificationsConfig
+		cloned.MaintNotificationsConfig = &maintNotifications
+	}
+	return &cloned
 }
 
 func (c *Client) homeTLSConfigLocked(addr string) (*tls.Config, error) {
@@ -276,6 +320,19 @@ func (c *Client) commandClient() (*redis.Client, error) {
 		return nil, ErrNotConnected
 	}
 	return cmd, nil
+}
+
+func (c *Client) pluginSyncCommandOptions() (*redis.Options, error) {
+	if errEnsure := c.ensureClients(); errEnsure != nil {
+		return nil, errEnsure
+	}
+	c.mu.Lock()
+	options := cloneRedisOptions(c.cmdOptions)
+	c.mu.Unlock()
+	if options == nil {
+		return nil, ErrNotConnected
+	}
+	return options, nil
 }
 
 func (c *Client) subscriptionClient() (*redis.Client, error) {
@@ -513,12 +570,21 @@ func (c *Client) GetConfig(ctx context.Context) ([]byte, error) {
 	return raw, nil
 }
 
-func (c *Client) GetModels(ctx context.Context) ([]byte, error) {
+func (c *Client) GetModels(ctx context.Context, headers http.Header, query url.Values) ([]byte, error) {
 	cmd, errClient := c.commandClient()
 	if errClient != nil {
 		return nil, errClient
 	}
-	raw, err := cmd.Get(ctx, redisKeyModels).Bytes()
+	req := modelsRequest{
+		Type:    "models",
+		Headers: headersToLowerMap(headers),
+		Query:   queryToLowerMap(query),
+	}
+	keyBytes, err := json.Marshal(&req)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := cmd.Get(ctx, string(keyBytes)).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return nil, ErrModelsNotFound
 	}
@@ -531,12 +597,253 @@ func (c *Client) GetModels(ctx context.Context) ([]byte, error) {
 	return raw, nil
 }
 
+func buildKVSetArgs(key string, value []byte, opts KVSetOptions) ([]any, error) {
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return nil, fmt.Errorf("home kv: key is empty")
+	}
+	if opts.EX > 0 && opts.PX > 0 {
+		return nil, fmt.Errorf("home kv: EX and PX are mutually exclusive")
+	}
+	if opts.EX < 0 || opts.PX < 0 {
+		return nil, fmt.Errorf("home kv: ttl must not be negative")
+	}
+	if opts.NX && opts.XX {
+		return nil, fmt.Errorf("home kv: NX and XX are mutually exclusive")
+	}
+
+	args := []any{key, append([]byte(nil), value...)}
+	if opts.EX > 0 {
+		args = append(args, "EX", durationCeil(opts.EX, time.Second))
+	}
+	if opts.PX > 0 {
+		args = append(args, "PX", durationCeil(opts.PX, time.Millisecond))
+	}
+	if opts.NX {
+		args = append(args, "NX")
+	}
+	if opts.XX {
+		args = append(args, "XX")
+	}
+	return args, nil
+}
+
+func durationCeil(value time.Duration, unit time.Duration) int64 {
+	if value <= 0 || unit <= 0 {
+		return 0
+	}
+	return int64((value + unit - 1) / unit)
+}
+
+func (c *Client) KVGet(ctx context.Context, key string) ([]byte, bool, error) {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return nil, false, errClient
+	}
+	raw, errGet := cmd.Get(ctx, key).Bytes()
+	if errors.Is(errGet, redis.Nil) {
+		return nil, false, nil
+	}
+	if errGet != nil {
+		return nil, false, errGet
+	}
+	return append([]byte(nil), raw...), true, nil
+}
+
+func (c *Client) KVSet(ctx context.Context, key string, value []byte, opts KVSetOptions) (bool, error) {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return false, errClient
+	}
+	args, errArgs := buildKVSetArgs(key, value, opts)
+	if errArgs != nil {
+		return false, errArgs
+	}
+	result, errSet := cmd.Do(ctx, append([]any{"SET"}, args...)...).Result()
+	if errors.Is(errSet, redis.Nil) {
+		return false, nil
+	}
+	if errSet != nil {
+		return false, errSet
+	}
+	if result == nil {
+		return false, nil
+	}
+	return true, nil
+}
+
+func (c *Client) KVSetNX(ctx context.Context, key string, value []byte, ttl time.Duration) (bool, error) {
+	opts := KVSetOptions{NX: true}
+	if ttl > 0 {
+		opts.EX = ttl
+	}
+	return c.KVSet(ctx, key, value, opts)
+}
+
+// KVCompareAndSwap atomically replaces a value only when its current state matches the expected state.
+func (c *Client) KVCompareAndSwap(ctx context.Context, key string, expected []byte, expectedExists bool, value []byte, ttl time.Duration) (bool, error) {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return false, errClient
+	}
+	const script = `
+local current = redis.call("GET", KEYS[1])
+if ARGV[1] == "1" then
+  if not current or current ~= ARGV[2] then
+    return 0
+  end
+elseif current then
+  return 0
+end
+local ttl = tonumber(ARGV[4])
+if ttl and ttl > 0 then
+  redis.call("SET", KEYS[1], ARGV[3], "PX", ttl)
+else
+  redis.call("SET", KEYS[1], ARGV[3])
+end
+return 1
+`
+	expectedFlag := "0"
+	if expectedExists {
+		expectedFlag = "1"
+	}
+	result, errEval := cmd.Eval(ctx, script, []string{key}, expectedFlag, expected, value, durationCeil(ttl, time.Millisecond)).Int64()
+	if errEval != nil {
+		return false, errEval
+	}
+	return result == 1, nil
+}
+
+func (c *Client) KVDel(ctx context.Context, keys ...string) (int64, error) {
+	if len(keys) == 0 {
+		return 0, nil
+	}
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return 0, errClient
+	}
+	return cmd.Del(ctx, keys...).Result()
+}
+
+func (c *Client) KVExpire(ctx context.Context, key string, ttl time.Duration) (bool, error) {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return false, errClient
+	}
+	return cmd.Expire(ctx, key, ttl).Result()
+}
+
+func (c *Client) KVTTL(ctx context.Context, key string) (time.Duration, bool, error) {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return 0, false, errClient
+	}
+	ttl, errTTL := cmd.TTL(ctx, key).Result()
+	if errTTL != nil {
+		return 0, false, errTTL
+	}
+	switch {
+	case ttl <= -2*time.Second:
+		return 0, false, nil
+	case ttl == -1*time.Second:
+		return 0, true, nil
+	default:
+		return ttl, true, nil
+	}
+}
+
+func (c *Client) KVIncrBy(ctx context.Context, key string, delta int64) (int64, error) {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return 0, errClient
+	}
+	return cmd.IncrBy(ctx, key, delta).Result()
+}
+
+func (c *Client) KVMGet(ctx context.Context, keys ...string) ([][]byte, []bool, error) {
+	if len(keys) == 0 {
+		return nil, nil, nil
+	}
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return nil, nil, errClient
+	}
+	items, errMGet := cmd.MGet(ctx, keys...).Result()
+	if errMGet != nil {
+		return nil, nil, errMGet
+	}
+	values := make([][]byte, len(items))
+	found := make([]bool, len(items))
+	for i, item := range items {
+		switch typed := item.(type) {
+		case nil:
+			continue
+		case string:
+			values[i] = []byte(typed)
+			found[i] = true
+		case []byte:
+			values[i] = append([]byte(nil), typed...)
+			found[i] = true
+		default:
+			return nil, nil, fmt.Errorf("home kv: unsupported MGET item type %T", item)
+		}
+	}
+	return values, found, nil
+}
+
+func (c *Client) KVMSet(ctx context.Context, pairs map[string][]byte) error {
+	if len(pairs) == 0 {
+		return nil
+	}
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return errClient
+	}
+	keys := make([]string, 0, len(pairs))
+	for key := range pairs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	args := make([]any, 0, 1+len(keys)*2)
+	args = append(args, "MSET")
+	for _, key := range keys {
+		args = append(args, key, append([]byte(nil), pairs[key]...))
+	}
+	return cmd.Do(ctx, args...).Err()
+}
+
 func headersToLowerMap(headers http.Header) map[string]string {
 	if len(headers) == 0 {
 		return nil
 	}
 	out := make(map[string]string, len(headers))
 	for key, values := range headers {
+		k := strings.ToLower(strings.TrimSpace(key))
+		if k == "" {
+			continue
+		}
+		if len(values) == 0 {
+			out[k] = ""
+			continue
+		}
+		trimmed := make([]string, 0, len(values))
+		for _, v := range values {
+			trimmed = append(trimmed, strings.TrimSpace(v))
+		}
+		out[k] = strings.Join(trimmed, ", ")
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func queryToLowerMap(query url.Values) map[string]string {
+	if len(query) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(query))
+	for key, values := range query {
 		k := strings.ToLower(strings.TrimSpace(key))
 		if k == "" {
 			continue
@@ -662,7 +969,215 @@ func (c *Client) RPushAppLog(ctx context.Context, payload []byte) error {
 	return cmd.RPush(ctx, redisKeyAppLog, payload).Err()
 }
 
-func (c *Client) handleSubscriptionPayload(channel string, payload string, onConfig func([]byte) error) error {
+func (c *Client) RPushPluginStatus(ctx context.Context, payload []byte) error {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return errClient
+	}
+	if len(payload) == 0 {
+		return nil
+	}
+	return cmd.RPush(ctx, redisKeyPluginStatus, payload).Err()
+}
+
+func (c *Client) GetPluginTasks(ctx context.Context) ([]PluginTask, error) {
+	cmd, errClient := c.commandClient()
+	if errClient != nil {
+		return nil, errClient
+	}
+	raw, errGet := cmd.Get(ctx, redisKeyPluginTasks).Bytes()
+	if errors.Is(errGet, redis.Nil) {
+		return nil, nil
+	}
+	if errGet != nil {
+		return nil, errGet
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var tasks []PluginTask
+	if errUnmarshal := json.Unmarshal(raw, &tasks); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	return tasks, nil
+}
+
+func (c *Client) GetPluginSync(ctx context.Context, request pluginstore.PluginSyncRequest) (pluginstore.PluginSyncResponse, error) {
+	options, errOptions := c.pluginSyncCommandOptions()
+	if errOptions != nil {
+		return pluginstore.PluginSyncResponse{}, errOptions
+	}
+	payload, errMarshal := json.Marshal(request)
+	if errMarshal != nil {
+		return pluginstore.PluginSyncResponse{}, fmt.Errorf("marshal plugin sync request: %w", errMarshal)
+	}
+	requestCmd := redis.NewStringCmd(ctx, "get", redisKeyPluginSync, string(payload))
+	if errProcess := processPluginSyncCommand(ctx, options, requestCmd); errProcess != nil {
+		if message, ok := pluginSyncUnsupportedMessage(errProcess.Error()); ok {
+			return pluginstore.PluginSyncResponse{}, fmt.Errorf("%w: %s", ErrPluginSyncUnsupported, message)
+		}
+		return pluginstore.PluginSyncResponse{}, errProcess
+	}
+	raw, errBytes := requestCmd.Bytes()
+	if errBytes != nil {
+		return pluginstore.PluginSyncResponse{}, errBytes
+	}
+	defer func() {
+		requestCmd.SetVal("")
+		for index := range raw {
+			raw[index] = 0
+		}
+	}()
+	if len(raw) == 0 {
+		return pluginstore.PluginSyncResponse{}, ErrEmptyResponse
+	}
+	if message, ok := pluginSyncUnsupportedResponse(raw); ok {
+		return pluginstore.PluginSyncResponse{}, fmt.Errorf("%w: %s", ErrPluginSyncUnsupported, message)
+	}
+	var response pluginstore.PluginSyncResponse
+	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
+		response.Clear()
+		return pluginstore.PluginSyncResponse{}, fmt.Errorf("decode plugin sync response: %w", errUnmarshal)
+	}
+	if errValidate := response.Validate(time.Now().UTC()); errValidate != nil {
+		response.Clear()
+		return pluginstore.PluginSyncResponse{}, errValidate
+	}
+	return response, nil
+}
+
+func processPluginSyncCommand(ctx context.Context, options *redis.Options, command redis.Cmder) error {
+	if options == nil {
+		return ErrNotConnected
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	pluginSyncClient := newPluginSyncCommandClient(ctx, options)
+	if pluginSyncClient == nil {
+		return ErrNotConnected
+	}
+	errProcess := pluginSyncClient.Process(ctx, command)
+	errClose := pluginSyncClient.Close()
+	if errContext := ctx.Err(); errContext != nil {
+		return errContext
+	}
+	if errProcess != nil {
+		return errProcess
+	}
+	if errClose != nil {
+		return fmt.Errorf("close plugin sync command client: %w", errClose)
+	}
+	return nil
+}
+
+func newPluginSyncCommandClient(ctx context.Context, template *redis.Options) *redis.Client {
+	options := cloneRedisOptions(template)
+	if options == nil {
+		return nil
+	}
+	options.MaintNotificationsConfig = &maintnotifications.Config{Mode: maintnotifications.ModeDisabled}
+	baseDialer := options.Dialer
+	if baseDialer == nil {
+		baseDialer = pluginSyncDialer(options)
+	}
+	options.Dialer = func(dialCtx context.Context, network string, address string) (net.Conn, error) {
+		conn, errDial := baseDialer(dialCtx, network, address)
+		if errDial != nil {
+			return nil, errDial
+		}
+		return newPluginSyncCancelableConn(ctx, conn), nil
+	}
+	options.ReadTimeout = homePluginSyncOperationTimeout
+	options.MaxRetries = -1
+	return redis.NewClient(options)
+}
+
+func pluginSyncDialer(options *redis.Options) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		dialer := &net.Dialer{Timeout: options.DialTimeout, KeepAlive: 5 * time.Minute}
+		conn, errDial := dialer.DialContext(ctx, network, address)
+		if errDial != nil {
+			return nil, errDial
+		}
+		if options.TLSConfig == nil {
+			return conn, nil
+		}
+		tlsConn := tls.Client(conn, options.TLSConfig)
+		if errHandshake := tlsConn.HandshakeContext(ctx); errHandshake != nil {
+			return nil, errors.Join(errHandshake, conn.Close())
+		}
+		return tlsConn, nil
+	}
+}
+
+type pluginSyncCancelableConn struct {
+	net.Conn
+	done chan struct{}
+	once sync.Once
+}
+
+func newPluginSyncCancelableConn(ctx context.Context, conn net.Conn) net.Conn {
+	wrapped := &pluginSyncCancelableConn{Conn: conn, done: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			if errDeadline := conn.SetDeadline(time.Now()); errDeadline != nil {
+				_ = conn.Close()
+			}
+		case <-wrapped.done:
+		}
+	}()
+	return wrapped
+}
+
+func (c *pluginSyncCancelableConn) Close() error {
+	if c == nil || c.Conn == nil {
+		return net.ErrClosed
+	}
+	c.once.Do(func() { close(c.done) })
+	return c.Conn.Close()
+}
+
+func pluginSyncUnsupportedResponse(raw []byte) (string, bool) {
+	var response struct {
+		Error struct {
+			Code    string `json:"code"`
+			Type    string `json:"type"`
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
+		return "", false
+	}
+	if pluginSyncUnsupportedCode(response.Error.Code) || pluginSyncUnsupportedCode(response.Error.Type) {
+		message := strings.TrimSpace(response.Error.Message)
+		if message == "" {
+			message = pluginSyncUnsupportedErrorType
+		}
+		return message, true
+	}
+	return pluginSyncUnsupportedMessage(response.Error.Message)
+}
+
+func pluginSyncUnsupportedCode(code string) bool {
+	return strings.EqualFold(strings.TrimSpace(code), pluginSyncUnsupportedErrorType)
+}
+
+func pluginSyncUnsupportedMessage(message string) (string, bool) {
+	message = strings.ToLower(strings.TrimSpace(message))
+	message = strings.TrimSpace(strings.TrimPrefix(message, "err "))
+	switch message {
+	case pluginSyncUnsupportedErrorType,
+		"unsupported key",
+		"wrong number of arguments for 'get' command":
+		return message, true
+	default:
+		return "", false
+	}
+}
+
+func (c *Client) handleSubscriptionPayload(ctx context.Context, channel string, payload string, onConfig func([]byte) error) error {
 	payload = strings.TrimSpace(payload)
 	if payload == "" {
 		return nil
@@ -781,7 +1296,7 @@ func (c *Client) StartConfigSubscriber(ctx context.Context, onConfig func([]byte
 				if msg == nil {
 					continue
 				}
-				if errApply := c.handleSubscriptionPayload(msg.Channel, msg.Payload, onConfig); errApply != nil {
+				if errApply := c.handleSubscriptionPayload(ctx, msg.Channel, msg.Payload, onConfig); errApply != nil {
 					if strings.EqualFold(strings.TrimSpace(msg.Channel), redisChannelCluster) {
 						log.Warn("failed to apply cluster update from home control center, ignoring")
 					} else {
